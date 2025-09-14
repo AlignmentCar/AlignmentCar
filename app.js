@@ -5,7 +5,6 @@ const SHARED_TOKEN = "shopSecret2025";
 const KEY_QUEUE = "car_entry_queue_v1";
 
 // ---------- helpers ----------
-
 function updateStatus() {
   const s = document.getElementById('status');
   if (s) s.textContent = navigator.onLine ? 'online' : 'offline';
@@ -35,7 +34,7 @@ function uppercaseExceptServices(fd) {
 function formatCarRegistration(raw) {
   if (!raw) return raw;
   var s = raw.toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
-  // try main regex: 1-2 letters, 1-2 digits, 0-4 letters/digits, 4 digits
+  // try main regex: 1-2 letters, 1-2 digits, 0-6 letters/digits, 4 digits
   var re = /^([A-Z]{1,2})(\d{1,2})([A-Z0-9]{0,6})(\d{4})$/;
   var m = s.match(re);
   if (m) {
@@ -44,7 +43,7 @@ function formatCarRegistration(raw) {
     var part3 = m[4];
     return part1 + " " + part2 + " " + part3;
   }
-  // fallback: if ends with 4 digits, split them and put space before last4, and space after first 1-2 letters if present
+  // fallback: if ends with 4 digits, split them and put space before last4
   var last4 = s.match(/(\d{4})$/);
   if (last4) {
     var last4Digits = last4[1];
@@ -58,38 +57,58 @@ function formatCarRegistration(raw) {
       return rest + " " + last4Digits;
     }
   }
-  // otherwise return cleaned uppercased string
   return s;
 }
 
-// JSONP helper
+// JSONP helper (improved error logging + longer timeout)
 function jsonpRequest(url, timeoutMs) {
-  timeoutMs = timeoutMs || 15000;
+  timeoutMs = timeoutMs || 25000; // increased timeout for slow mobile networks
   return new Promise(function(resolve, reject) {
-    var cbName = "jsonp_cb_" + Date.now() + "_" + Math.floor(Math.random()*100000);
+    var cbName = "jsonp_cb_" + Date.now() + "_" + Math.floor(Math.random()*1000000);
+    var called = false;
     window[cbName] = function(data) {
+      called = true;
       try { resolve(data); } finally {
         try { delete window[cbName]; } catch(e){}
         var s = document.getElementById(cbName);
         if (s && s.parentNode) s.parentNode.removeChild(s);
       }
     };
+    // ensure callback param not present already
     url = url.replace(/(&|\?)?callback=[^&]*/i, "");
     var full = url + (url.indexOf('?') === -1 ? '?' : '&') + 'callback=' + encodeURIComponent(cbName);
     var script = document.createElement('script');
     script.id = cbName;
     script.src = full;
     script.async = true;
-    script.onerror = function() {
+
+    script.onerror = function(ev) {
       try { delete window[cbName]; } catch(e){}
       if (script.parentNode) script.parentNode.removeChild(script);
-      reject(new Error('JSONP script load error'));
+      var err = new Error('JSONP script load error');
+      err.detail = ev || null;
+      reject(err);
     };
+
     var timer = setTimeout(function(){
       try { delete window[cbName]; } catch(e){}
       if (script.parentNode) script.parentNode.removeChild(script);
       reject(new Error('JSONP timeout'));
     }, timeoutMs);
+
+    // On successful load but no callback invoked (server returned HTML or login page),
+    // we wait a short grace period then fail clearly.
+    script.onload = function() {
+      // if callback hasn't been invoked within 1200ms after load, assume invalid response
+      setTimeout(function(){
+        if (!called) {
+          try { delete window[cbName]; } catch(e){}
+          if (script.parentNode) script.parentNode.removeChild(script);
+          reject(new Error('JSONP loaded but callback never called — server may be returning HTML or a login page (check web app permissions).'));
+        }
+      }, 1200);
+    };
+
     document.body.appendChild(script);
   });
 }
@@ -194,6 +213,28 @@ function clearForm(){
 document.addEventListener('DOMContentLoaded', function() {
   updateStatus();
 
+  // --- New: attempt to remove any old service workers & clear caches so mobile gets latest files ---
+  (async function unregisterSWandClearCaches() {
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        for (const r of regs) {
+          try { await r.unregister(); console.log('unregistered SW'); } catch(e){}
+        }
+      }
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        for (const k of keys) {
+          try { await caches.delete(k); console.log('deleted cache', k); } catch(e){}
+        }
+      }
+      // small delay to allow browser to release caches
+      await new Promise(r=>setTimeout(r, 200));
+    } catch(e) {
+      console.warn('SW/cache cleanup failed', e);
+    }
+  })();
+
   const submitBtn = document.getElementById('submitBtn');
   const clearBtn = document.getElementById('clearBtn');
 
@@ -260,8 +301,14 @@ document.addEventListener('DOMContentLoaded', function() {
               }
             } catch (errSend) {
               console.warn('send failed -> queueing', errSend);
+              // helpful diagnostic: if JSONP script failed with message about "callback never called"
+              if (errSend && errSend.message && errSend.message.indexOf('callback never called') !== -1) {
+                showMessage('Network/server problem — check web app deployment & permissions. Changes saved locally.');
+                console.error('JSONP callback not invoked — likely web app not accessible (needs "Anyone, even anonymous" access or correct ENDPOINT).');
+              } else {
+                showMessage('Network error — saved locally.');
+              }
               queueSubmission(formData);
-              showMessage('Network error — saved locally.');
             }
             // try flush again
             try { await flushQueue(); } catch(e){}
@@ -323,16 +370,3 @@ document.addEventListener('DOMContentLoaded', function() {
   }, 300);
 
 }); // DOMContentLoaded end
-
-
-
-
-
-
-
-
-
-
-
-
-
